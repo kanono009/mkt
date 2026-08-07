@@ -42,8 +42,6 @@ class OverlayService : Service() {
     private lateinit var timing: Handler
     private val token = Any()
 
-    @Volatile private var liveX = 0f
-    @Volatile private var liveY = 0f
     @Volatile private var armed = false
 
     override fun onCreate() {
@@ -56,8 +54,7 @@ class OverlayService : Service() {
         ).apply { start() }
         timing = Handler(timingThread.looper)
 
-        // Warm the timing thread's binder path with a harmless IPC.
-        // This is NOT a gesture: no tap is injected, the quiz never sees it.
+        // Warm the timing thread's binder path with a harmless IPC (NOT a tap).
         timing.post {
             runCatching {
                 (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
@@ -103,8 +100,6 @@ class OverlayService : Service() {
         }
         tapButton.setOnTouchListener(ButtonDrag())
         wm.addView(tapButton, tapParams)
-        liveX = tapParams.x + size / 2f
-        liveY = tapParams.y + size / 2f
     }
 
     private fun buildPanel() {
@@ -183,7 +178,9 @@ class OverlayService : Service() {
     }
 
     // ------------------------------------------------------------------
-    // Countdown: exactly two taps, both from the same warm thread.
+    // Countdown: exactly two taps.
+    // Fire path = hide + dispatch inside ONE main-thread message
+    // (the most stable path measured on-device).
     // ------------------------------------------------------------------
 
     private fun startCountdown() {
@@ -204,63 +201,56 @@ class OverlayService : Service() {
         cancelPending(null)
         armed = true
 
-        // Hide now so the immediate gesture passes through (v1 behavior).
-        tapButton.visibility = View.INVISIBLE
+        // Single monotonic base, captured once.
+        val baseUptime = SystemClock.uptimeMillis()
+        val baseNano = System.nanoTime()
+        val effectiveMs = ms - COMPENSATION_MS
+        val targetNano = baseNano + effectiveMs * 1_000_000L
+        val targetUptime = baseUptime + effectiveMs
 
-        // Everything timing-critical happens on the timing thread so both
-        // taps use the identical dispatch path (same thread, warm binder).
-        timing.post {
-            if (!armed) return@post
+        // Tap 1: hide + dispatch in one main-thread message.
+        performTap("Immediate")
 
-            val baseUptime = SystemClock.uptimeMillis()
-            val baseNano = System.nanoTime()
-            val effectiveMs = ms - COMPENSATION_MS
-            val targetNano = baseNano + effectiveMs * 1_000_000L
-            val targetUptime = baseUptime + effectiveMs
-
-            // Tap 1: immediate, from this thread.
-            fire("Immediate")
-
-            main.postAtTime({ tapButton.visibility = View.VISIBLE }, token, baseUptime + 200L)
-
-            main.postAtTime(
-                { tapButton.visibility = View.INVISIBLE },
-                token,
-                maxOf(baseUptime, targetUptime - HIDE_LEAD_MS)
-            )
-            main.postAtTime(
-                { tapButton.visibility = View.VISIBLE },
-                token,
-                targetUptime + RESTORE_AFTER_MS
-            )
-
-            // Tap 2: deadline spin, then dispatch from this same thread.
-            timing.postAtTime({
-                var now = System.nanoTime()
-                while (armed && now < targetNano - SPIN_WINDOW_NS) {
-                    SystemClock.sleep(1)
-                    now = System.nanoTime()
-                }
-                while (armed && System.nanoTime() < targetNano) { }
-                if (!armed) return@postAtTime
-                fire("Delayed")
+        // Tap 2: wake exactly, spin, then same fire path on main.
+        timing.postAtTime({
+            var now = System.nanoTime()
+            while (armed && now < targetNano - SPIN_WINDOW_NS) {
+                SystemClock.sleep(1)
+                now = System.nanoTime()
+            }
+            while (armed && System.nanoTime() < targetNano) { }
+            if (!armed) return@postAtTime
+            main.post {
+                if (!armed) return@post
+                performTap("Delayed")
                 armed = false
-                main.post { status("Done. Delayed tap fired at live position.") }
-            }, token, maxOf(baseUptime, targetUptime - WAKE_LEAD_MS))
-        }
+                status("Done. Delayed tap fired at live position.")
+            }
+        }, token, maxOf(baseUptime, targetUptime - WAKE_LEAD_MS))
 
         status(
             String.format(Locale.US, "Armed: second tap at +%.3f s.", ms / 1000.0)
         )
     }
 
-    private fun fire(label: String) {
-        val dispatched = TapService.tapAt(liveX, liveY, TAP_DURATION_MS) { success ->
-            if (!success) main.post { status("$label tap cancelled by the system.") }
+    private fun performTap(label: String) {
+        val centerX = tapParams.x + tapParams.width / 2f
+        val centerY = tapParams.y + tapParams.height / 2f
+
+        tapButton.visibility = View.INVISIBLE
+
+        val dispatched = TapService.tapAt(centerX, centerY, TAP_DURATION_MS) { ok ->
+            if (!ok) main.post { status("$label tap cancelled by the system.") }
         }
         if (!dispatched) {
             main.post { status("$label dispatch failed. Is the tap service enabled?") }
         }
+
+        main.postAtTime(
+            { tapButton.visibility = View.VISIBLE },
+            token,
+            SystemClock.uptimeMillis() + RESTORE_AFTER_MS
+        )
     }
 
     private fun cancelPending(message: String?) {
@@ -269,11 +259,6 @@ class OverlayService : Service() {
         timing.removeCallbacksAndMessages(token)
         tapButton.visibility = View.VISIBLE
         if (message != null) status(message)
-    }
-
-    private fun refreshCenter() {
-        liveX = tapParams.x + tapParams.width / 2f
-        liveY = tapParams.y + tapParams.height / 2f
     }
 
     private fun togglePanel() {
@@ -368,7 +353,6 @@ class OverlayService : Service() {
                     tapParams.x = startX + dx.roundToInt()
                     tapParams.y = startY + dy.roundToInt()
                     wm.updateViewLayout(tapButton, tapParams)
-                    refreshCenter()
                 }
                 MotionEvent.ACTION_UP -> if (!moved) togglePanel()
             }
@@ -413,15 +397,16 @@ class OverlayService : Service() {
         private const val BUTTON_DP = 56
         private const val TAP_DURATION_MS = 100L
         private const val MAX_DELAY_MS = 31_000L
-        private const val HIDE_LEAD_MS = 100L
-        private const val RESTORE_AFTER_MS = 250L
+        private const val RESTORE_AFTER_MS = 200L
         private const val WAKE_LEAD_MS = 6L
         private const val SPIN_WINDOW_NS = 3_000_000L
 
-        // Constant trim for the residual input-pipeline offset.
-        // If your tester shows a steady +X ms, set this to X.
-        // Start with 2.
-        private const val COMPENSATION_MS = 2L
+        // Constant trim for the device's fixed pipeline offset.
+        // Calibrate ONCE with the tester: run 4 pairs, take the median.
+        //   median 22003 -> keep 3
+        //   median 22006 -> set 6
+        //   median 21998 -> set 1
+        private const val COMPENSATION_MS = 3L
 
         private const val PASSIVE_FLAGS =
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
