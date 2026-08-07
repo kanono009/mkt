@@ -32,7 +32,6 @@ class OverlayService : Service() {
     private lateinit var wm: WindowManager
     private lateinit var tapButton: TextView
     private lateinit var panel: LinearLayout
-    private lateinit var probe: View
     private lateinit var tapParams: WindowManager.LayoutParams
     private lateinit var panelParams: WindowManager.LayoutParams
     private lateinit var delayField: EditText
@@ -46,11 +45,6 @@ class OverlayService : Service() {
     @Volatile private var liveX = 0f
     @Volatile private var liveY = 0f
     @Volatile private var armed = false
-    @Volatile private var calibrating = false
-    @Volatile private var calibMs = 0L
-    private var hasCalibrated = false
-    private val calSamples = mutableListOf<Long>()
-    private val probeDowns = ArrayDeque<Long>()
 
     override fun onCreate() {
         super.onCreate()
@@ -62,9 +56,17 @@ class OverlayService : Service() {
         ).apply { start() }
         timing = Handler(timingThread.looper)
 
+        // Warm the timing thread's binder path with a harmless IPC.
+        // This is NOT a gesture: no tap is injected, the quiz never sees it.
+        timing.post {
+            runCatching {
+                (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                    .areNotificationsEnabled()
+            }
+        }
+
         startForeground(NOTIF_ID, buildNotification())
         buildTapButton()
-        buildProbe()
         buildPanel()
     }
 
@@ -73,19 +75,13 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         armed = false
-        calibrating = false
         main.removeCallbacksAndMessages(token)
         timing.removeCallbacksAndMessages(token)
         timingThread.quitSafely()
         runCatching { wm.removeView(tapButton) }
         runCatching { wm.removeView(panel) }
-        runCatching { wm.removeView(probe) }
         super.onDestroy()
     }
-
-    // ------------------------------------------------------------------
-    // Windows
-    // ------------------------------------------------------------------
 
     private fun buildTapButton() {
         val size = dp(BUTTON_DP)
@@ -111,38 +107,6 @@ class OverlayService : Service() {
         liveY = tapParams.y + size / 2f
     }
 
-    private fun buildProbe() {
-        val size = dp(PROBE_DP)
-        probe = View(this).apply {
-            setBackgroundColor(0x00000000)
-            setOnTouchListener { _, event ->
-                if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                    val down = event.downTime
-                    main.post { onProbeDown(down) }
-                }
-                true
-            }
-        }
-        val params = WindowManager.LayoutParams(
-            size, size, overlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.BOTTOM or Gravity.START
-            x = dp(6)
-            y = dp(6)
-        }
-        wm.addView(probe, params)
-    }
-
-    private fun probeCenter(): Pair<Float, Float> {
-        val size = dp(PROBE_DP)
-        val h = resources.displayMetrics.heightPixels
-        val cx = dp(6) + size / 2f
-        val cy = h - dp(6) - size / 2f
-        return cx to cy
-    }
-
     private fun buildPanel() {
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -151,7 +115,7 @@ class OverlayService : Service() {
         }
         panel.addView(
             TextView(this).apply {
-                text = "AccuTap v3"
+                text = "AccuTap"
                 textSize = 16f
                 setTextColor(0xFFFFFFFF.toInt())
             },
@@ -180,14 +144,6 @@ class OverlayService : Service() {
 
         panel.addView(
             Button(this).apply {
-                text = "AUTO-CALIBRATE"
-                setOnClickListener { startCalibration() }
-            },
-            LinearLayout.LayoutParams(-1, dp(44))
-        )
-
-        panel.addView(
-            Button(this).apply {
                 text = "START COUNTDOWN"
                 setOnClickListener { startCountdown() }
             },
@@ -203,7 +159,7 @@ class OverlayService : Service() {
         )
 
         statusView = TextView(this).apply {
-            text = "1) AUTO-CALIBRATE once. 2) Drag TAP, set delay, start."
+            text = "Drag TAP onto target, set delay, start."
             textSize = 12f
             setTextColor(0xFFE2E8F0.toInt())
             setPadding(0, dp(6), 0, 0)
@@ -227,106 +183,15 @@ class OverlayService : Service() {
     }
 
     // ------------------------------------------------------------------
-    // Self-calibration: measures this device's two-tap pipeline offset
-    // using our own probe window, then compensates every real run.
-    // ------------------------------------------------------------------
-
-    private fun onProbeDown(downTime: Long) {
-        if (!calibrating) return
-        if (probeDowns.size < 2) probeDowns.addLast(downTime)
-    }
-
-    private fun startCalibration() {
-        if (calibrating || armed) return
-        if (!TapService.ready) {
-            status("Enable the accessibility tap service first.")
-            return
-        }
-        hideIme()
-        setPanelInputMode(false)
-        calibrating = true
-        calSamples.clear()
-        status("Calibrating… do not touch the screen.")
-        runCalibrationRound(0)
-    }
-
-    private fun runCalibrationRound(round: Int) {
-        probeDowns.clear()
-        val (px, py) = probeCenter()
-
-        val baseUptime = SystemClock.uptimeMillis()
-        val baseNano = System.nanoTime()
-        val targetNano = baseNano + PROBE_GAP_MS * 1_000_000L
-        val targetUptime = baseUptime + PROBE_GAP_MS
-
-        // Mirror the real flow's hide scheduling so relayout state matches.
-        main.postAtTime(
-            { tapButton.visibility = View.INVISIBLE },
-            token,
-            maxOf(baseUptime, targetUptime - HIDE_LEAD_MS)
-        )
-        main.postAtTime(
-            { tapButton.visibility = View.VISIBLE },
-            token,
-            targetUptime + RESTORE_AFTER_MS
-        )
-
-        // Probe A via the main thread, exactly like the real immediate tap.
-        TapService.tapAt(px, py, TAP_DURATION_MS, null)
-
-        // Probe B via the timing thread, exactly like the real delayed tap.
-        timing.postAtTime({
-            var now = System.nanoTime()
-            while (calibrating && now < targetNano - SPIN_WINDOW_NS) {
-                SystemClock.sleep(1)
-                now = System.nanoTime()
-            }
-            while (calibrating && System.nanoTime() < targetNano) { }
-            if (calibrating) TapService.tapAt(px, py, TAP_DURATION_MS, null)
-        }, token, maxOf(baseUptime, targetUptime - WAKE_LEAD_MS))
-
-        main.postAtTime({
-            val downs = probeDowns.toList()
-            if (downs.size >= 2) {
-                calSamples.add((downs[1] - downs[0]) - PROBE_GAP_MS)
-            }
-            if (round < CAL_ROUNDS - 1) runCalibrationRound(round + 1)
-            else finishCalibration()
-        }, token, SystemClock.uptimeMillis() + PROBE_GAP_MS + 400)
-    }
-
-    private fun finishCalibration() {
-        calibrating = false
-        if (calSamples.isNotEmpty()) {
-            val sorted = calSamples.sorted()
-            calibMs = sorted[sorted.size / 2]
-            hasCalibrated = true
-            status(
-                "Calibrated: compensating $calibMs ms. Now start your countdown."
-            )
-        } else {
-            status("Calibration failed. Enable service and retry.")
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Countdown
+    // Countdown: exactly two taps, both from the same warm thread.
     // ------------------------------------------------------------------
 
     private fun startCountdown() {
         hideIme()
         setPanelInputMode(false)
 
-        if (calibrating) {
-            status("Calibration in progress…")
-            return
-        }
         if (!TapService.ready) {
             status("Enable the accessibility tap service first.")
-            return
-        }
-        if (!hasCalibrated) {
-            status("Press AUTO-CALIBRATE once first.")
             return
         }
 
@@ -339,48 +204,53 @@ class OverlayService : Service() {
         cancelPending(null)
         armed = true
 
-        val effectiveMs = ms - calibMs
-        val baseUptime = SystemClock.uptimeMillis()
-        val baseNano = System.nanoTime()
-        val targetNano = baseNano + effectiveMs * 1_000_000L
-        val targetUptime = baseUptime + effectiveMs
-
-        // Immediate tap: hide first so the gesture passes through (v1 style).
+        // Hide now so the immediate gesture passes through (v1 behavior).
         tapButton.visibility = View.INVISIBLE
-        fire("Immediate")
-        main.postAtTime({ tapButton.visibility = View.VISIBLE }, token, baseUptime + 250L)
 
-        main.postAtTime(
-            { tapButton.visibility = View.INVISIBLE },
-            token,
-            maxOf(baseUptime, targetUptime - HIDE_LEAD_MS)
-        )
-        main.postAtTime(
-            { tapButton.visibility = View.VISIBLE },
-            token,
-            targetUptime + RESTORE_AFTER_MS
-        )
+        // Everything timing-critical happens on the timing thread so both
+        // taps use the identical dispatch path (same thread, warm binder).
+        timing.post {
+            if (!armed) return@post
 
-        timing.postAtTime({
-            var now = System.nanoTime()
-            while (armed && now < targetNano - SPIN_WINDOW_NS) {
-                SystemClock.sleep(1)
-                now = System.nanoTime()
-            }
-            while (armed && System.nanoTime() < targetNano) { }
-            if (!armed) return@postAtTime
-            fire("Delayed")
-            armed = false
-            main.post { status("Done. Delayed tap fired at live position.") }
-        }, token, maxOf(baseUptime, targetUptime - WAKE_LEAD_MS))
+            val baseUptime = SystemClock.uptimeMillis()
+            val baseNano = System.nanoTime()
+            val effectiveMs = ms - COMPENSATION_MS
+            val targetNano = baseNano + effectiveMs * 1_000_000L
+            val targetUptime = baseUptime + effectiveMs
+
+            // Tap 1: immediate, from this thread.
+            fire("Immediate")
+
+            main.postAtTime({ tapButton.visibility = View.VISIBLE }, token, baseUptime + 200L)
+
+            main.postAtTime(
+                { tapButton.visibility = View.INVISIBLE },
+                token,
+                maxOf(baseUptime, targetUptime - HIDE_LEAD_MS)
+            )
+            main.postAtTime(
+                { tapButton.visibility = View.VISIBLE },
+                token,
+                targetUptime + RESTORE_AFTER_MS
+            )
+
+            // Tap 2: deadline spin, then dispatch from this same thread.
+            timing.postAtTime({
+                var now = System.nanoTime()
+                while (armed && now < targetNano - SPIN_WINDOW_NS) {
+                    SystemClock.sleep(1)
+                    now = System.nanoTime()
+                }
+                while (armed && System.nanoTime() < targetNano) { }
+                if (!armed) return@postAtTime
+                fire("Delayed")
+                armed = false
+                main.post { status("Done. Delayed tap fired at live position.") }
+            }, token, maxOf(baseUptime, targetUptime - WAKE_LEAD_MS))
+        }
 
         status(
-            String.format(
-                Locale.US,
-                "Armed: %.3f s (compensated %d ms).",
-                ms / 1000.0,
-                calibMs
-            )
+            String.format(Locale.US, "Armed: second tap at +%.3f s.", ms / 1000.0)
         )
     }
 
@@ -400,10 +270,6 @@ class OverlayService : Service() {
         tapButton.visibility = View.VISIBLE
         if (message != null) status(message)
     }
-
-    // ------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------
 
     private fun refreshCenter() {
         liveX = tapParams.x + tapParams.width / 2f
@@ -471,7 +337,7 @@ class OverlayService : Service() {
         }
         return builder
             .setContentTitle("AccuTap is running")
-            .setContentText("Calibrate once, then run two-tap countdowns.")
+            .setContentText("Drag TAP, set delay, start countdown.")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .setOngoing(true)
             .build()
@@ -545,15 +411,17 @@ class OverlayService : Service() {
         private const val CHANNEL_ID = "accutap_overlay"
         private const val NOTIF_ID = 7
         private const val BUTTON_DP = 56
-        private const val PROBE_DP = 20
         private const val TAP_DURATION_MS = 100L
         private const val MAX_DELAY_MS = 31_000L
         private const val HIDE_LEAD_MS = 100L
         private const val RESTORE_AFTER_MS = 250L
         private const val WAKE_LEAD_MS = 6L
         private const val SPIN_WINDOW_NS = 3_000_000L
-        private const val PROBE_GAP_MS = 500L
-        private const val CAL_ROUNDS = 3
+
+        // Constant trim for the residual input-pipeline offset.
+        // If your tester shows a steady +X ms, set this to X.
+        // Start with 2.
+        private const val COMPENSATION_MS = 2L
 
         private const val PASSIVE_FLAGS =
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
