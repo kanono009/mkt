@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AccuTap</string>
+    <string name="accessibility_service_description">Allows AccuTap to perform user-triggered taps at the visible floating button position.</string>
+</resources>

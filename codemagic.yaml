@@ -1,0 +1,36 @@
+workflows:
+  android-debug:
+    name: AccuTap Debug Build
+    max_build_duration: 45
+
+    environment:
+      vars:
+        PACKAGE_NAME: "com.example.accutap"
+      java: 17
+
+    scripts:
+      - name: Show Java version
+        script: |
+          java -version
+
+      - name: Ensure Gradle 8.7 wrapper
+        script: |
+          set -e
+
+          if [ ! -x "./gradlew" ]; then
+            echo "No Gradle wrapper found. Generating one with Gradle 8.7."
+            curl -sL https://services.gradle.org/distributions/gradle-8.7-bin.zip -o /tmp/gradle-8.7-bin.zip
+            unzip -q /tmp/gradle-8.7-bin.zip -d /tmp
+            /tmp/gradle-8.7/bin/gradle --no-daemon wrapper --gradle-version 8.7
+          fi
+
+          chmod +x ./gradlew
+
+      - name: Build debug APK
+        script: |
+          ./gradlew --no-daemon assembleDebug
+
+    artifacts:
+      - app/build/outputs/**/*.apk
+      - app/build/outputs/**/*.aab
+      - app/build/reports/**
